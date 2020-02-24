@@ -1,0 +1,168 @@
+theory iot-ot 
+begin
+
+builtins: symmetric-encryption, hashing, signing, asymmetric-encryption
+
+section{* OT *}
+
+/*
+ * Protocol:	ownership-transfer
+ * Modeler: 	Martin Gunnarsson
+ * Date: 	May 2017
+ * Source:	N/A
+ * Property: 	
+ *
+ * Status: 	WIP
+ */
+
+
+functions: h1/1
+functions: h2/1
+
+
+/* Protocol rules */
+rule init_rs:
+	[Fr(~ResetKey), Fr(~RS_Priv)]
+	--[OnlyOnceV('RS')]->
+	[!RS($RS, ~ResetKey, ~RS_Priv), !Pub_rs($RS, pk(~RS_Priv)),  Out(pk(~RS_Priv))]
+
+rule init_old_owner:
+	[Fr(~Old_Priv)]
+	--[OnlyOnceV('Old')]->
+	[!OldOwner($Old, ~Old_Priv), !Pub_old($Old, pk(~Old_Priv)),  Out(pk(~Old_Priv))]
+
+rule init_new_owner:
+        [Fr(~New_Priv)]
+        --[OnlyOnceV('New')]->
+        [!NewOwner($New, ~New_Priv), !Pub_new($New, pk(~New_Priv)), Out(pk(~New_Priv))]
+
+rule init_iot:
+	[]
+	-->
+	[!IoT($ID)]
+
+rule provision_rs_keys:
+	let
+	Ki = h1(<~ResetKey, $ID>)
+	in
+	[!RS($RS, ~ResetKey, ~RS_Priv), !IoT($ID), Fr(~TokenKey)]
+	--[OnlyOnceV('RS_key')]->
+	[!TokenKey($RS, $ID, ~TokenKey, Ki)]
+
+rule provison_owner_keys:
+	[!OldOwner($Old, ~Old_Priv), !IoT($ID), Fr(~OwnerKey1), Fr(~OwnerKey2)]
+	--[OnlyOnceV('Old_key')]->
+	[!OwnerKeys($Old, $ID, ~OwnerKey1, ~OwnerKey2)]
+
+rule generate_token:
+        let token = senc( ~nonce, ~TokenKey)
+        Ki = h1(<~ResetKey, $ID>)
+        KS = h1(<Ki, ~nonce>)
+	KS_enc = aenc(KS, pk(~New_Priv))
+	KS_sign = sign(KS, ~RS_Priv)
+        in
+        [!RS($RS, ~ResetKey, ~RS_Priv), !Pub_new($New, pk(~New_Priv)), !IoT($ID), Fr(~nonce), !TokenKey($RS, $ID, ~TokenKey, Ki)]
+        -->
+        [Out(token), Out(<KS_enc, KS_sign>) ]
+
+rule send_owner_key2:
+	let
+	OwnerKey2_enc = aenc(~OwnerKey2, pk(~New_Priv))
+	OwnerKey2_sign =  sign(~OwnerKey2, ~Old_Priv)
+	in
+	[!OldOwner($Old, ~Old_Priv), !NewOwner($New, ~New_Priv), !OwnerKeys($Old, $ID, ~OwnerKey1, ~OwnerKey2)]
+	-->
+	[Out(<OwnerKey2_enc, OwnerKey2_sign>)]
+
+rule new_generate_PSK:
+	let
+	KS_dec = adec(KS_enc, ~New_Priv)
+	OwnerKey2_dec = adec(OwnerKey2_enc, ~New_Priv)
+        PSK = h1(<KS_dec, OwnerKey2_dec>)
+        in
+        [In(<KS_enc, KS_Sign>), In(<OwnerKey2_enc, OwnerKey2_Sign>), !NewOwner($New, ~New_Priv), !Pub_old($Old, pk(~Old_Priv)), !Pub_rs($RS, pk(~RS_Priv)) ]
+        --[
+	Eq(verify(KS_Sign, KS_dec, pk(~RS_Priv)),true),
+	Eq(verify(OwnerKey2_Sign, OwnerKey2_dec, pk(~Old_Priv)), true),
+        New_owner_ownership_transfer_key(PSK)
+        ]->
+        []
+
+rule receive_token:
+        let nonce = sdec(token, ~TokenKey)
+        KS = h1(<Ki, nonce>)
+        PSK = h1(<KS, ~OwnerKey2>)
+        in
+        [In(token), !IoT($ID), !TokenKey($RS, $ID, ~TokenKey, Ki), !OwnerKeys($Old, $ID, ~OwnerKey1, ~OwnerKey2)]
+        --[
+        IoT_PSK(PSK), Secret(PSK)
+        ]->
+        []
+
+rule Reveal_old_owner:
+	[!OldOwner($Old, ~Old_Priv), !OwnerKeys($Old, $ID, ~OwnerKey1, ~OwnerKey2)]
+	--[ Reveal($Old_owner)]->
+	[ Out(<~OwnerKey1, ~OwnerKey2, ~Old_Priv>) ]
+
+
+rule Reveal_new_owner:
+	[!NewOwner($New, ~New_Priv)]
+	--[ Reveal($New_owner) ]->
+	[Out(~New_Priv)]   
+
+
+restriction OnlyOnceV:
+"All #i #j x. OnlyOnceV(x)@#i & OnlyOnceV(x)@#j ==> #i = #j"
+
+restriction Equality:
+"All x y #i. Eq(x,y) @i ==> x = y"
+
+/* Old owner shall never learn OwnerKey1' and OwnerKey2'
+ It shall not be possible for the advisary to know OwnerKey1' & OwnerKey2', given full access to Old Owner, unless a key compromise of New_Owner has been done. 
+*/
+lemma forward_secrecy:
+	"
+ 	All Old_owner PSK #i #j #k.
+	(
+	IoT_PSK(PSK) @ #i &
+	New_owner_ownership_transfer_key(PSK) @ #j & 	
+	Reveal(Old_owner) @ #k &
+	not( Ex New_owner #l. Reveal(New_owner) @ #l )
+	)
+	==>
+	not (Ex #m.  K(PSK) @ #m)
+	"
+
+lemma backwards_secrecy:
+	"
+	All New_owner PSK #i #j #k.
+	(
+	IoT_PSK(PSK) @ #i &
+	New_owner_ownership_transfer_key(PSK) @ #j &
+	Reveal(New_owner) @ #k &
+	not(Ex Old_owner #l.  Reveal(Old_owner)  @ #l ) 
+	)
+	==>
+	not( Ex OwnerKey1 OwnerKey2 #m #n. K(OwnerKey1) @ #m & K(OwnerKey2) @ #n)
+	"
+
+lemma no_outsider_secrecy:
+	"
+	All PSK #i #j.
+	( IoT_PSK(PSK) @ #i &
+	New_owner_ownership_transfer_key(PSK) @ #j &
+	not( Ex Old_owner #k. Reveal(Old_owner) @ #k ) &
+	not( Ex New_owner #l. Reveal(New_owner) @ #l )
+	)
+	==>
+	not(Ex #k. K(PSK) @ #k ) 
+	"
+
+lemma protocol_executable:
+	exists-trace
+	" Ex PSK1 PSK2 #i #j.
+		New_owner_ownership_transfer_key(PSK1) @ #i &
+		IoT_PSK(PSK2) @ #j  &
+		PSK1 = PSK2
+	" 
+end
